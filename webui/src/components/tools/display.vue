@@ -6,7 +6,9 @@ import {
     DisconnectOutlined,
     ExpandOutlined,
     CompressOutlined,
-    ReloadOutlined
+    ReloadOutlined,
+    CopyOutlined,
+    SnippetsOutlined
 } from '@ant-design/icons-vue';
 
 const settingsStore = useSettingsStore();
@@ -17,6 +19,7 @@ const vncStatus = ref(null);
 const connectionState = ref('disconnected'); // disconnected, connecting, connected, error
 const errorMessage = ref('');
 const isFullscreen = ref(false);
+const remoteClipboardText = ref('');
 
 // DOM 引用
 const vncContainer = ref(null);
@@ -86,6 +89,10 @@ async function connectVnc() {
             rfb.sendCredentials({ password: '' });
         });
 
+        rfb.addEventListener('clipboard', (e) => {
+            remoteClipboardText.value = e.detail?.text || '';
+        });
+
     } catch (e) {
         connectionState.value = 'error';
         errorMessage.value = e.message || '连接失败';
@@ -111,6 +118,43 @@ function toggleFullscreen() {
     } else {
         document.exitFullscreen();
         isFullscreen.value = false;
+    }
+}
+
+// 同步远程剪切板到本地
+async function syncRemoteClipboardToLocal() {
+    if (connectionState.value !== 'connected') {
+        errorMessage.value = '请先连接 VNC';
+        return;
+    }
+    if (!remoteClipboardText.value) {
+        errorMessage.value = '当前没有可同步的远程剪切板内容，请先在远程窗口中复制文本';
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(remoteClipboardText.value);
+        errorMessage.value = '';
+    } catch (e) {
+        errorMessage.value = e?.message || '写入本地剪切板失败';
+    }
+}
+
+// 同步本地剪切板到远程
+async function syncLocalClipboardToRemote() {
+    if (connectionState.value !== 'connected' || !rfb) {
+        errorMessage.value = '请先连接 VNC';
+        return;
+    }
+    try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+            errorMessage.value = '本地剪切板为空';
+            return;
+        }
+        rfb.clipboardPasteFrom(text);
+        errorMessage.value = '';
+    } catch (e) {
+        errorMessage.value = e?.message || '读取本地剪切板失败';
     }
 }
 
@@ -183,6 +227,18 @@ onUnmounted(() => {
                                 <DisconnectOutlined />
                             </template>
                             断开
+                        </a-button>
+                        <a-button @click="syncLocalClipboardToRemote" :disabled="connectionState !== 'connected'">
+                            <template #icon>
+                                <SnippetsOutlined />
+                            </template>
+                            本地剪切板 to VNC
+                        </a-button>
+                        <a-button @click="syncRemoteClipboardToLocal" :disabled="connectionState !== 'connected'">
+                            <template #icon>
+                                <CopyOutlined />
+                            </template>
+                            VNC剪切板 to 本地
                         </a-button>
                         <a-button @click="toggleFullscreen" :disabled="connectionState !== 'connected'">
                             <template #icon>

@@ -325,7 +325,8 @@ onUnmounted(() => {
 
 <style scoped>
 .log-container {
-    max-height: 600px;
+    max-height: 800px;
+    min-height: 650px;
     overflow-y: auto;
     overflow-x: auto;
     font-family: 'Consolas', 'Monaco', monospace;

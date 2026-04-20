@@ -20,52 +20,107 @@ const TARGET_URL = 'https://chatgpt.com/?temporary-chat=true'; // 感谢 @zhongj
 const INPUT_SELECTOR = '.ProseMirror';
 
 /**
+ * 判断模型菜单是否已经打开
+ * @param {import('playwright-core').Page} page
+ * @returns {Promise<boolean>}
+ */
+async function isModelMenuOpen(page) {
+    const menuLocator = page.locator('[role="menu"] [data-testid^="model-switcher-"], [role="menu"] [data-testid="Legacy models-submenu"]');
+    return await menuLocator.first().isVisible().catch(() => false);
+}
+
+/**
+ * 尝试打开模型菜单
+ * 说明：不同账号/页面状态下，模型按钮的 accessible name 可能不同，
+ * 因此这里采用多候选定位方式，而不是只依赖 “Model selector”。
+ * @param {import('playwright-core').Page} page
+ * @param {object} meta
+ * @returns {Promise<void>}
+ */
+async function openModelMenu(page, meta = {}) {
+    if (await isModelMenuOpen(page)) {
+        logger.info('适配器', '模型菜单已处于打开状态', meta);
+        return;
+    }
+
+    const candidates = [
+        {
+            desc: 'Model selector 按钮',
+            locator: page.getByRole('button', { name: /^Model selector/i })
+        },
+        {
+            desc: '包含 ChatGPT 文案的按钮',
+            locator: page.getByRole('button', { name: /(ChatGPT|Instant|Thinking|Pro)\s*5\.[34]/i })
+        },
+        {
+            desc: '包含 ChatGPT 文案的任意菜单触发器',
+            locator: page.locator('[aria-haspopup="menu"]').filter({ hasText: /(ChatGPT|Instant|Thinking|Pro)\s*5\.[34]/i }).first()
+        },
+        {
+            desc: '包含 ChatGPT 文案的任意按钮',
+            locator: page.locator('button').filter({ hasText: /(ChatGPT|Instant|Thinking|Pro)\s*5\.[34]/i }).first()
+        }
+    ];
+
+    for (const candidate of candidates) {
+        try {
+            const count = await candidate.locator.count();
+            if (count === 0) continue;
+
+            logger.info('适配器', `尝试打开模型菜单: ${candidate.desc}`, meta);
+            await safeClick(page, candidate.locator.first(), { bias: 'button', timeout: 5000 });
+            await sleep(300, 500);
+
+            if (await isModelMenuOpen(page)) {
+                logger.info('适配器', `模型菜单已打开: ${candidate.desc}`, meta);
+                return;
+            }
+        } catch (e) {
+            logger.warn('适配器', `尝试打开模型菜单失败 (${candidate.desc}): ${e.message}`, meta);
+        }
+    }
+
+    throw new Error('未能打开模型菜单');
+}
+
+/**
  * 通过 UI 选择模型
  * @param {import('playwright-core').Page} page - 页面对象
- * @param {string} codeName - 模型 codeName
+ * @param {{id: string, testId: string}} modelConfig - 模型配置
  * @param {object} meta - 日志元数据
  * @returns {Promise<boolean>} 是否成功选择了模型
  */
-async function selectModel(page, codeName, meta = {}) {
+async function selectModel(page, modelConfig, meta = {}) {
+    const { id: modelId, testId } = modelConfig;
+
     try {
-        // 1. 点击 Model selector 按钮
-        const modelSelectorBtn = page.getByRole('button', { name: /^Model selector/ });
-        const btnExists = await modelSelectorBtn.count();
-        if (btnExists === 0) {
-            logger.debug('适配器', '未找到模型选择器按钮，跳过选择模型', meta);
-            return false;
+        logger.info('适配器', `准备选择模型: ${modelId}`, meta);
+
+        await openModelMenu(page, meta);
+
+        const targetMenuItem = page.locator(`[data-testid="${testId}"]`).first();
+        const targetExists = await targetMenuItem.count();
+
+        if (targetExists === 0) {
+            throw new Error(`模型菜单中未找到目标项: ${testId}`);
         }
 
-        await modelSelectorBtn.waitFor({ timeout: 5000 });
-        await safeClick(page, modelSelectorBtn, { bias: 'button' });
+        const alreadyChecked = await targetMenuItem.getAttribute('aria-checked').catch(() => null);
+        if (alreadyChecked === 'true') {
+            logger.info('适配器', `目标模型已是当前模型: ${modelId}`, meta);
+            await page.keyboard.press('Escape').catch(() => {});
+            return true;
+        }
+
+        logger.info('适配器', `点击目标模型: ${modelId} (${testId})`, meta);
+        await safeClick(page, targetMenuItem, { bias: 'button', timeout: 5000 });
         await sleep(300, 500);
 
-        // 2. 检查是否有 Legacy models 选项
-        const legacyMenuItem = page.getByRole('menuitem', { name: /^Legacy models/ });
-        const legacyExists = await legacyMenuItem.count();
-        if (legacyExists > 0) {
-            logger.debug('适配器', '发现 Legacy models 选项，正在点击...', meta);
-            await safeClick(page, legacyMenuItem, { bias: 'button' });
-            await sleep(300, 500);
-        }
-
-        // 3. 查找匹配 codeName 开头的 menuitem
-        const targetMenuItem = page.getByRole('menuitem', { name: new RegExp(`^${codeName}`) });
-        const targetExists = await targetMenuItem.count();
-        if (targetExists > 0) {
-            logger.info('适配器', `正在选择模型: ${codeName}`, meta);
-            await safeClick(page, targetMenuItem, { bias: 'button' });
-            return true;
-        } else {
-            logger.debug('适配器', `未找到模型 ${codeName}，使用默认模型`, meta);
-            // 点击空白区域关闭菜单
-            await page.keyboard.press('Escape');
-            return false;
-        }
+        logger.info('适配器', `模型选择完成: ${modelId}`, meta);
+        return true;
     } catch (e) {
-        logger.warn('适配器', `选择模型失败: ${e.message}`, meta);
-        // 尝试关闭菜单
-        await page.keyboard.press('Escape').catch(() => { });
+        logger.error('适配器', `选择模型失败: ${modelId} | ${e.message}`, meta);
+        await page.keyboard.press('Escape').catch(() => {});
         return false;
     }
 }
@@ -82,7 +137,6 @@ async function selectModel(page, codeName, meta = {}) {
 async function generate(context, prompt, imgPaths, modelId, meta = {}) {
     const { page, config } = context;
     const waitTimeout = config?.backend?.pool?.waitTimeout ?? 120000;
-    const sendBtnLocator = page.getByRole('button', { name: 'Send prompt' });
 
     try {
         logger.info('适配器', '开启新会话...', meta);
@@ -92,10 +146,17 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         await waitForInput(page, INPUT_SELECTOR, { click: false });
 
         // 2. 选择模型
-        const modelConfig = manifest.models.find(m => m.id === modelId);
-        const targetModel = modelConfig?.codeName || modelId;
-        if (targetModel) {
-            await selectModel(page, targetModel, meta);
+        if (modelId) {
+            const modelConfig = manifest.models.find(m => m.id === modelId);
+            if (!modelConfig) {
+                logger.error('适配器', `不支持的模型: ${modelId}`, meta);
+                return { error: `不支持的模型: ${modelId}` };
+            }
+
+            const selected = await selectModel(page, modelConfig, meta);
+            if (!selected) {
+                return { error: `模型选择失败: ${modelId}` };
+            }
         }
 
         // 3. 上传图片 (双击 Add files and more 按钮)
@@ -109,17 +170,15 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             const addFilesBtn = page.getByRole('button', { name: 'Add files and more' });
 
             await uploadFilesViaChooser(page, addFilesBtn, imgPaths, {
-                clickAction: 'dblclick',  // 使用双击
+                clickAction: 'dblclick',
                 uploadValidator: (response) => {
                     const url = response.url();
                     if (response.status() === 200) {
-                        // 上传请求
                         if (url.includes('backend-api/files') && !url.includes('process_upload_stream')) {
                             uploadedCount++;
                             logger.debug('适配器', `图片上传进度: ${uploadedCount}/${expectedUploads}`, meta);
                             return false;
                         }
-                        // 处理完成请求
                         if (url.includes('backend-api/files/process_upload_stream')) {
                             processedCount++;
                             logger.info('适配器', `图片处理进度: ${processedCount}/${expectedUploads}`, meta);
@@ -134,17 +193,17 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             }, meta);
         }
 
-        // 3. 输入提示词
+        // 4. 输入提示词
         logger.info('适配器', '输入提示词...', meta);
         await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
         await humanType(page, INPUT_SELECTOR, prompt);
 
-        // 4. 先启动 SSE 监听，再发送提示词（避免竞态）
+        // 5. 先启动 SSE 监听，再发送提示词（避免竞态）
         logger.info('适配器', '监听 SSE 流获取文本...', meta);
 
         let textContent = '';
         let isComplete = false;
-        let targetMessageId = null;  // 只追踪 channel: "final" 的消息
+        let targetMessageId = null;
 
         const responsePromise = page.waitForResponse(async (response) => {
             const url = response.url();
@@ -157,7 +216,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 const lines = body.split('\n');
 
                 for (const line of lines) {
-                    // 跳过空行和事件行
                     if (!line.startsWith('data: ')) continue;
 
                     const dataStr = line.slice(6).trim();
@@ -169,39 +227,31 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     try {
                         const data = JSON.parse(dataStr);
 
-                        // 检测目标消息 (assistant 角色, channel: "final", content_type: "text")
                         if (data.v?.message?.author?.role === 'assistant' &&
                             data.v?.message?.channel === 'final' &&
                             data.v?.message?.content?.content_type === 'text') {
                             targetMessageId = data.v.message.id;
-                            // 重置内容（即使 parts[0] 为空也要重置，清除之前 commentary 的文本）
                             const parts = data.v.message.content.parts;
                             textContent = (parts && parts[0]) || '';
                         }
 
-                        // 以下所有内容累积都必须在 targetMessageId 设置之后才执行
-                        // 避免误收 commentary / thinking 频道的内容
                         if (!targetMessageId) continue;
 
-                        // 累积 delta 内容 (append 操作，顶层 path)
                         if (data.o === 'append' && data.p === '/message/content/parts/0' && data.v) {
                             textContent += data.v;
                         }
 
-                        // patch 操作中的 append (数组格式)
                         if (Array.isArray(data.v)) {
                             for (const patch of data.v) {
                                 if (patch.o === 'append' && patch.p === '/message/content/parts/0' && patch.v) {
                                     textContent += patch.v;
                                 }
-                                // 仅在 targetMessageId 存在时检查完成
                                 if (patch.p === '/message/status' && patch.v === 'finished_successfully') {
                                     isComplete = true;
                                 }
                             }
                         }
 
-                        // message_stream_complete 表示完成
                         if (data.type === 'message_stream_complete') {
                             isComplete = true;
                         }
@@ -216,13 +266,13 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             }
         }, { timeout: waitTimeout });
 
-        // 5. 发送提示词
+        // 6. 发送提示词
         logger.debug('适配器', '发送提示词...', meta);
         await page.keyboard.press('Enter');
 
         logger.info('适配器', '等待生成结果...', meta);
 
-        // 6. 等待 SSE 响应完成
+        // 7. 等待 SSE 响应完成
         try {
             await responsePromise;
         } catch (e) {
@@ -241,7 +291,6 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         return { text: textContent.trim() };
 
     } catch (err) {
-        // 顶层错误处理
         const pageError = normalizePageError(err, meta);
         if (pageError) return pageError;
 
@@ -258,22 +307,24 @@ export const manifest = {
     displayName: 'ChatGPT (文本生成)',
     description: '使用 ChatGPT 官网生成文本，支持多模型切换和图片上传。需要已登录的 ChatGPT 账户，若需要选择模型，请使用会员账号 (包含 K12 教室认证账号)。',
 
-    // 入口 URL
     getTargetUrl(config, workerConfig) {
         return TARGET_URL;
     },
 
-    // 模型列表
     models: [
-        { id: 'gpt-5.4', codeName: 'GPT-5.4 Instant', imagePolicy: 'optional' },
-        { id: 'gpt-5.4-thinking', codeName: 'GPT-5.4 Thinking', imagePolicy: 'optional' },
-        { id: 'gpt-5.3', codeName: 'GPT-5.3 Instant', imagePolicy: 'optional' },
-        { id: 'gpt-5.3-thinking', codeName: 'GPT-5.3 Thinking', imagePolicy: 'optional' },
+        {
+            id: 'gpt-5.3',
+            testId: 'model-switcher-gpt-5-3',
+            imagePolicy: 'optional'
+        },
+        {
+            id: 'gpt-5.4-thinking',
+            testId: 'model-switcher-gpt-5-4-thinking',
+            imagePolicy: 'optional'
+        }
     ],
 
-    // 无需导航处理器
     navigationHandlers: [],
 
-    // 核心文本生成方法
     generate
 };
